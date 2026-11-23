@@ -1,8 +1,12 @@
 import json
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 RUTA_DATOS = Path(__file__).parent / "datos"
 RUTA_LIBROS = RUTA_DATOS / "libros.json"
@@ -98,6 +102,12 @@ def hay_duplicado(titulo: str, autor: str, id_ignorado: int | None = None) -> bo
     )
 
 
+@app.get("/", summary="Estado de la API")
+def inicio() -> dict[str, str]:
+    """Devuelve el mensaje de bienvenida de la API."""
+    return {"mensaje": "API de la biblioteca"}
+
+
 @app.get("/libros", response_model=list[Libro], summary="Listar libros")
 def listar_libros(
     autor: str | None = None,
@@ -130,6 +140,17 @@ def buscar_libros(texto: str = Query(...)) -> list[Libro]:
     ]
 
 
+@app.get("/libros/estadisticas", summary="Consultar estadísticas")
+def estadisticas() -> dict[str, int]:
+    """Devuelve el total de libros, disponibles y prestados."""
+    disponibles = sum(libro.disponible for libro in libros)
+    return {
+        "total": len(libros),
+        "disponibles": disponibles,
+        "prestados": len(libros) - disponibles,
+    }
+
+
 @app.post(
     "/libros",
     response_model=Libro,
@@ -147,6 +168,31 @@ def crear_libro(entrada: LibroEntrada) -> Libro:
     siguiente_id += 1
     libros.append(libro)
     guardar_libros()
+    logger.info("Se creó el libro con id %s", libro.id)
+    return libro
+
+
+@app.post("/libros/{id}/prestar", response_model=Libro, summary="Prestar un libro")
+def prestar_libro(id: int) -> Libro:
+    """Marca un libro como prestado y guarda el cambio."""
+    libro = buscar_libro(id)
+    if not libro.disponible:
+        raise HTTPException(status_code=409, detail="El libro ya está prestado")
+    libro.disponible = False
+    guardar_libros()
+    logger.info("Se prestó el libro con id %s", id)
+    return libro
+
+
+@app.post("/libros/{id}/devolver", response_model=Libro, summary="Devolver un libro")
+def devolver_libro(id: int) -> Libro:
+    """Marca un libro como disponible y guarda el cambio."""
+    libro = buscar_libro(id)
+    if libro.disponible:
+        raise HTTPException(status_code=409, detail="El libro ya está disponible")
+    libro.disponible = True
+    guardar_libros()
+    logger.info("Se devolvió el libro con id %s", id)
     return libro
 
 
@@ -167,6 +213,7 @@ def reemplazar_libro(id: int, entrada: LibroEntrada) -> Libro:
     actualizado = Libro(id=id, **entrada.model_dump())
     libros[libros.index(anterior)] = actualizado
     guardar_libros()
+    logger.info("Se reemplazó el libro con id %s", id)
     return actualizado
 
 
@@ -184,6 +231,7 @@ def modificar_libro(id: int, cambios: LibroCambios) -> Libro:
     if cambios.model_fields_set:
         libros[libros.index(anterior)] = actualizado
         guardar_libros()
+        logger.info("Se modificó el libro con id %s", id)
     return actualizado
 
 
@@ -195,4 +243,5 @@ def eliminar_libro(id: int) -> Response:
     libro = buscar_libro(id)
     libros.remove(libro)
     guardar_libros()
+    logger.info("Se eliminó el libro con id %s", id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
