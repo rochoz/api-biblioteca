@@ -1,6 +1,7 @@
 import json
 import logging
 from pathlib import Path
+from threading import Lock
 
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -10,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 RUTA_DATOS = Path(__file__).parent / "datos"
 RUTA_LIBROS = RUTA_DATOS / "libros.json"
+RUTA_CONTADOR = RUTA_DATOS / "contador.json"
 
 
 class Libro(BaseModel):
@@ -79,9 +81,43 @@ def guardar_libros() -> None:
     )
 
 
+def guardar_contador(valor: int) -> None:
+    """Persiste el próximo ID disponible de forma segura ante interrupciones."""
+    RUTA_DATOS.mkdir(parents=True, exist_ok=True)
+    ruta_temporal = RUTA_CONTADOR.with_suffix(".json.tmp")
+    ruta_temporal.write_text(
+        json.dumps({"siguiente_id": valor}), encoding="utf-8"
+    )
+    ruta_temporal.replace(RUTA_CONTADOR)
+
+
+def cargar_siguiente_id(libros_guardados: list[Libro]) -> int:
+    """Carga el contador y lo reconcilia con los IDs que siguen guardados."""
+    minimo = max((libro.id for libro in libros_guardados), default=0) + 1
+    if not RUTA_CONTADOR.exists():
+        guardar_contador(minimo)
+        return minimo
+
+    try:
+        datos = json.loads(RUTA_CONTADOR.read_text(encoding="utf-8"))
+        valor = datos["siguiente_id"]
+        if type(valor) is not int or valor < 1:
+            raise ValueError("El siguiente ID debe ser un entero positivo")
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"El contador de IDs es inválido: {RUTA_CONTADOR}"
+        ) from error
+
+    reconciliado = max(valor, minimo)
+    if reconciliado != valor:
+        guardar_contador(reconciliado)
+    return reconciliado
+
+
 libros = cargar_libros()
-siguiente_id = max((libro.id for libro in libros), default=0) + 1
+siguiente_id = cargar_siguiente_id(libros)
 app = FastAPI(title="API de la biblioteca")
+bloqueo_creacion = Lock()
 
 
 def buscar_libro(id_libro: int) -> Libro:
@@ -160,14 +196,22 @@ def estadisticas() -> dict[str, int]:
 def crear_libro(entrada: LibroEntrada) -> Libro:
     """Crea un libro nuevo y asigna el siguiente ID disponible."""
     global siguiente_id
-    if hay_duplicado(entrada.titulo, entrada.autor):
-        raise HTTPException(
-            status_code=409, detail="Ya existe un libro con el mismo título y autor"
-        )
-    libro = Libro(id=siguiente_id, **entrada.model_dump())
-    siguiente_id += 1
-    libros.append(libro)
-    guardar_libros()
+    with bloqueo_creacion:
+        if hay_duplicado(entrada.titulo, entrada.autor):
+            raise HTTPException(
+                status_code=409, detail="Ya existe un libro con el mismo título y autor"
+            )
+        id_libro = siguiente_id
+        libro = Libro(id=id_libro, **entrada.model_dump())
+        # Reservar el ID antes de guardar el libro permite dejar un salto ante fallos.
+        guardar_contador(id_libro + 1)
+        siguiente_id = id_libro + 1
+        libros.append(libro)
+        try:
+            guardar_libros()
+        except Exception:
+            libros.remove(libro)
+            raise
     logger.info("Se creó el libro con id %s", libro.id)
     return libro
 

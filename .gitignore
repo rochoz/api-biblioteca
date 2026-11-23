@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .tmp/
 .ruff_cache/
+datos/contador.json
+datos/contador.json.tmp
